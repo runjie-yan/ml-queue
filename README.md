@@ -11,6 +11,39 @@ queue/data/queue.sqlite
 queue/data/log/
 ```
 
+## Installation
+
+Use it as a standalone repo:
+
+```bash
+git clone git@github.com:<USER_OR_ORG>/ml-queue.git
+cd ml-queue
+python submit.py -- echo hello
+python worker.py --once
+```
+
+Use it as a submodule inside another ML project:
+
+```bash
+cd /path/to/your/ml-project
+git submodule add git@github.com:<USER_OR_ORG>/ml-queue.git queue
+git commit -m "Add ml-queue submodule"
+```
+
+Clone the ML project later with:
+
+```bash
+git clone --recurse-submodules git@github.com:<USER_OR_ORG>/<ML_PROJECT>.git
+```
+
+For an existing clone:
+
+```bash
+git submodule update --init --recursive
+```
+
+When changing queue code from inside the parent project, commit and push inside `queue/` first, then commit the updated submodule pointer in the parent repo.
+
 ## Submit One Command
 
 ```bash
