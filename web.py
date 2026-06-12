@@ -5,6 +5,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
+from itertools import product
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -171,13 +172,6 @@ def display_path(path: Path, *, root: Path = REPO_ROOT) -> str:
         return str(path)
 
 
-def recursive_yaml_files(folder: Path) -> list[Path]:
-    return sorted(
-        [path for path in folder.rglob("*") if path.is_file() and path.suffix in {".yaml", ".yml"}],
-        key=lambda path: path.as_posix(),
-    )
-
-
 def recursive_files(folder: Path) -> list[Path]:
     return sorted([path for path in folder.rglob("*") if path.is_file()], key=lambda path: path.as_posix())
 
@@ -186,49 +180,61 @@ def render_template(template: str, values: dict[str, str]) -> str:
     return PLACEHOLDER_RE.sub(lambda match: values[match.group(1).strip()], template)
 
 
-def expand_template(template: str, values: dict[str, str], *, root: Path = REPO_ROOT) -> list[dict[str, Any]]:
-    resolved_values: dict[str, str] = {}
-    expanded_name: str | None = None
-    expanded_files: list[Path] | None = None
+def value_lines(value: str) -> list[str]:
+    return [line.strip() for line in value.splitlines() if line.strip()]
 
-    for placeholder in parse_placeholders(template):
-        if placeholder.name not in values:
-            raise TemplateError(f"missing value for placeholder {{{placeholder.name}:{placeholder.kind}}}")
-        raw_value = values[placeholder.name].strip()
-        if placeholder.kind in {"name", "text"}:
-            if not raw_value:
-                raise TemplateError(f"text placeholder {{{placeholder.name}}} must not be empty")
-            resolved_values[placeholder.name] = raw_value
-            continue
 
-        selected = resolve_under_root(raw_value, root=root)
+def resolve_placeholder_values(placeholder: Placeholder, raw_value: str, *, root: Path) -> list[str]:
+    lines = value_lines(raw_value)
+    if not lines:
+        raise TemplateError(f"placeholder {{{placeholder.name}:{placeholder.kind}}} must not be empty")
+
+    if placeholder.kind in {"name", "text"}:
+        return lines
+
+    resolved: list[str] = []
+    for line in lines:
+        selected = resolve_under_root(line, root=root)
         if placeholder.kind == "folder":
             if not selected.is_dir():
-                raise TemplateError(f"folder placeholder {{{placeholder.name}:folder}} requires a folder")
-            resolved_values[placeholder.name] = display_path(selected, root=root)
+                raise TemplateError(f"folder placeholder {{{placeholder.name}:folder}} requires a folder: {line}")
+            resolved.append(display_path(selected, root=root))
             continue
 
         if selected.is_file():
-            resolved_values[placeholder.name] = display_path(selected, root=root)
+            resolved.append(display_path(selected, root=root))
         elif selected.is_dir():
-            if expanded_name is not None:
-                raise TemplateError("only one file placeholder can recursively expand from a selected folder")
-            expanded_name = placeholder.name
-            expanded_files = recursive_files(selected)
-            if not expanded_files:
-                raise TemplateError(f"folder has no recursive files: {raw_value}")
+            files = recursive_files(selected)
+            if not files:
+                raise TemplateError(f"folder has no recursive files: {line}")
+            resolved.extend(display_path(path, root=root) for path in files)
         else:
-            raise TemplateError(f"file placeholder {{{placeholder.name}:file}} path does not exist")
+            raise TemplateError(f"file placeholder {{{placeholder.name}:file}} path does not exist: {line}")
+    return resolved
 
-    if expanded_name is None:
-        return [{"command": render_template(template, resolved_values), "values": dict(resolved_values), "expanded_placeholder": None}]
+
+def expand_template(template: str, values: dict[str, str], *, root: Path = REPO_ROOT) -> list[dict[str, Any]]:
+    placeholders = parse_placeholders(template)
+    resolved_options: dict[str, list[str]] = {}
+    expanded_names: list[str] = []
+
+    for placeholder in placeholders:
+        if placeholder.name not in values:
+            raise TemplateError(f"missing value for placeholder {{{placeholder.name}:{placeholder.kind}}}")
+        options = resolve_placeholder_values(placeholder, values[placeholder.name], root=root)
+        resolved_options[placeholder.name] = options
+        if len(options) > 1:
+            expanded_names.append(placeholder.name)
 
     results: list[dict[str, Any]] = []
-    assert expanded_files is not None
-    for file_path in expanded_files:
-        item_values = dict(resolved_values)
-        item_values[expanded_name] = display_path(file_path, root=root)
-        results.append({"command": render_template(template, item_values), "values": item_values, "expanded_placeholder": expanded_name})
+    names = [placeholder.name for placeholder in placeholders]
+    for combo in product(*(resolved_options[name] for name in names)):
+        item_values = dict(zip(names, combo))
+        results.append({
+            "command": render_template(template, item_values),
+            "values": item_values,
+            "expanded_placeholder": ",".join(expanded_names) if expanded_names else None,
+        })
     return results
 
 
@@ -240,10 +246,9 @@ def placeholder_inputs(template: str, values: dict[str, str]) -> str:
     fields = []
     for placeholder in parse_placeholders(template):
         value = values.get(placeholder.name, "")
-        list_attr = ' list="path-options"' if placeholder.kind in {"file", "folder"} else ""
         fields.append(
             f'<div><label>{html.escape(placeholder.name)} <span class="muted">{html.escape(placeholder.kind)}</span></label>'
-            f'<input data-placeholder="{html.escape(placeholder.name)}" name="ph__{html.escape(placeholder.name)}" value="{html.escape(value)}"{list_attr}></div>'
+            f'<textarea class="placeholder-value" data-placeholder="{html.escape(placeholder.name)}" name="ph__{html.escape(placeholder.name)}" rows="2">{html.escape(value)}</textarea></div>'
         )
     return "".join(fields) if fields else '<p class="muted">No placeholders found.</p>'
 
@@ -346,6 +351,8 @@ h1 {{ margin: 0 0 12px; font-size: 24px; }}
 h2 {{ margin: 0 0 10px; font-size: 16px; }}
 textarea, input {{ box-sizing: border-box; width: 100%; border: 1px solid #bcccdc; border-radius: 6px; padding: 8px 9px; font: inherit; }}
 textarea {{ min-height: 132px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+#template-text {{ overflow: auto; white-space: pre; word-wrap: normal; resize: vertical; tab-size: 4; }}
+.placeholder-value {{ min-height: 70px; resize: vertical; white-space: pre; overflow: auto; line-height: 1.45; }}
 label {{ display: block; font-weight: 650; margin-top: 12px; margin-bottom: 4px; }}
 button {{ border: 1px solid #0ea5e9; border-radius: 6px; background: #0284c7; color: white; padding: 8px 12px; margin-top: 12px; margin-right: 8px; cursor: pointer; font-weight: 650; }}
 button.secondary {{ background: #fff; color: #075985; }}
@@ -390,8 +397,7 @@ function refreshFields() {{
     const kind = m[2] || 'name';
     if (seen.has(name)) continue;
     seen.add(name);
-    const list = (kind === 'file' || kind === 'folder') ? ' list="path-options"' : '';
-    parts.push(`<div><label>${{esc(name)}} <span class="muted">${{esc(kind)}}</span></label><input data-placeholder="${{esc(name)}}" name="ph__${{esc(name)}}" value="${{esc(old[name] || '')}}"${{list}}></div>`);
+    parts.push(`<div><label>${{esc(name)}} <span class="muted">${{esc(kind)}}</span></label><textarea class="placeholder-value" data-placeholder="${{esc(name)}}" name="ph__${{esc(name)}}" rows="2">${{esc(old[name] || '')}}</textarea></div>`);
   }}
   document.getElementById('placeholder-fields').innerHTML = parts.length ? parts.join('') : '<p class="muted">No placeholders found.</p>';
   updatePreview();
@@ -428,7 +434,17 @@ async function saveTemplate() {{
   window.location = '/?template=' + encodeURIComponent(data.name);
 }}
 window.addEventListener('DOMContentLoaded', () => {{
-  document.getElementById('template-text')?.addEventListener('input', refreshFields);
+  const templateText = document.getElementById('template-text');
+  templateText?.addEventListener('input', refreshFields);
+  templateText?.addEventListener('keydown', event => {{
+    if (event.key !== 'Tab') return;
+    event.preventDefault();
+    const start = templateText.selectionStart;
+    const end = templateText.selectionEnd;
+    templateText.value = templateText.value.slice(0, start) + '\\t' + templateText.value.slice(end);
+    templateText.selectionStart = templateText.selectionEnd = start + 1;
+    refreshFields();
+  }});
   document.getElementById('placeholder-fields')?.addEventListener('input', updatePreview);
   document.getElementById('cwd')?.addEventListener('input', updatePreview);
   updatePreview();
@@ -508,10 +524,6 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             selected_name = str(form_state.get("selected_template", selected_name))
 
         placeholders = placeholder_inputs(template, values)
-        path_options = "\n".join(
-            f'<option value="{html.escape(display_path(path, root=self.repo_root))}"></option>'
-            for path in recursive_yaml_files(self.repo_root / "config")
-        )
         return f"""
 <h1>Command Template</h1>
 {message}
@@ -528,14 +540,13 @@ class QueueWebHandler(BaseHTTPRequestHandler):
       <textarea id="template-text" name="template">{html.escape(template)}</textarea>
       <label>Placeholder Values</label>
       <div id="placeholder-fields" class="grid">{placeholders}</div>
-      <datalist id="path-options">{path_options}</datalist>
     </form>
   </section>
   <aside class="surface">
     <h2>Exact Command Preview</h2>
     <pre id="live-preview" class="cmd"></pre>
     <div class="actions"><button onclick="copyText('live-preview')">Copy</button><button form="template-form" type="submit">Submit To Queue</button></div>
-    <p class="muted">If one file placeholder points to a folder, preview and submit expand it into one command per recursive file.</p>
+    <p class="muted">Each placeholder line is one expansion value. File placeholders also expand folders into one value per recursive file.</p>
   </aside>
 </div>
 {self.template_modal(selected_name)}

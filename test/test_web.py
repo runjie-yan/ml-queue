@@ -72,13 +72,15 @@ class TemplateExpansionTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["command"], "train --config-dir configs")
 
-    def test_only_one_file_placeholder_can_expand_from_folder(self) -> None:
-        with self.assertRaises(web.TemplateError):
-            web.expand_template(
-                "train --config {config:file} --other {other:file}",
-                {"config": "configs", "other": "configs"},
-                root=self.root,
-            )
+    def test_file_placeholder_folder_expansion_can_combine_with_other_files(self) -> None:
+        result = web.expand_template(
+            "train --config {config:file} --other {other:file}",
+            {"config": "configs", "other": "configs/a.yaml"},
+            root=self.root,
+        )
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0]["command"], "train --config configs/a.yaml --other configs/a.yaml")
 
     def test_multiple_placeholders_can_use_same_expanded_file(self) -> None:
         result = web.expand_template(
@@ -114,6 +116,41 @@ class TemplateExpansionTest(unittest.TestCase):
             result[0]["command"],
             "/usr/bin/python queue/submit.py --queue-dir data --type BASE -- echo hello",
         )
+
+    def test_text_placeholder_expands_one_value_per_line(self) -> None:
+        result = web.expand_template(
+            "echo {item:name}",
+            {"item": "one\ntwo\nthree"},
+            root=self.root,
+        )
+
+        self.assertEqual([item["command"] for item in result], ["echo one", "echo two", "echo three"])
+
+    def test_multiple_placeholder_lists_expand_as_cartesian_product(self) -> None:
+        result = web.expand_template(
+            "echo {left:name} {right:name}",
+            {"left": "a\nb", "right": "1\n2"},
+            root=self.root,
+        )
+
+        self.assertEqual([item["command"] for item in result], [
+            "echo a 1",
+            "echo a 2",
+            "echo b 1",
+            "echo b 2",
+        ])
+
+    def test_file_placeholder_accepts_multiline_paths_and_folder_expansion(self) -> None:
+        result = web.expand_template(
+            "train --config {config:file}",
+            {"config": "configs/a.yaml\nconfigs/nested"},
+            root=self.root,
+        )
+
+        self.assertEqual([item["command"] for item in result], [
+            "train --config configs/a.yaml",
+            "train --config configs/nested/b.yml",
+        ])
 
 
 class WebSubmissionTest(unittest.TestCase):
@@ -212,7 +249,12 @@ class WebSubmissionTest(unittest.TestCase):
         self.assertIn("save-modal", body)
         self.assertIn("example-submit-task", body)
         self.assertIn("example-worker", body)
+        self.assertIn('textarea class="placeholder-value"', body)
         self.assertNotIn("<label>Worker Type</label>", body)
+
+        full_page = web.page("Queue Submit", body).decode("utf-8")
+        self.assertIn("templateText?.addEventListener('keydown'", full_page)
+        self.assertIn("#template-text { overflow: auto; white-space: pre;", full_page)
 
     def test_template_cards_show_name_and_template_snippet(self) -> None:
         web.save_template(

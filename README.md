@@ -97,11 +97,11 @@ The web UI can generate arbitrary shell commands from templates, copy them, subm
 
 Template placeholders:
 
-- `{config:file}`: select one file, or select a folder to recursively generate one command per file.
-- `{data:folder}`: select one folder and use that folder path as-is.
-- `{name:text}` or `{worker type:name}`: plain text value.
+- `{config:file}`: one file path per line. A folder line expands recursively into one value per file.
+- `{data:folder}`: one folder path per line. Folder paths are used as-is.
+- `{name:text}` or `{worker type:name}`: one plain text value per line.
 
-Only one `file` placeholder may expand recursively from a selected folder. Multiple placeholders can be used in one template.
+Every non-empty placeholder line is an expansion value. If multiple placeholders have multiple values, the preview and submit action generate the Cartesian product of those values.
 
 The first two built-in templates are queue examples:
 
@@ -110,7 +110,7 @@ The first two built-in templates are queue examples:
 /usr/bin/python queue/worker.py --queue-dir {queue-dir:folder} --type {worker type:name}
 ```
 
-The right panel shows the exact command lines that will be submitted. If one file placeholder points to a folder, the preview expands it into one command per recursive file. Saving opens a popup with a name field and cancel option.
+The right panel shows the exact command lines that will be submitted. Long command templates can be scrolled horizontally, and pressing Tab inside the command template inserts a tab character. Saving opens a popup with a name field and cancel option.
 
 Saved templates are readable JSON files:
 

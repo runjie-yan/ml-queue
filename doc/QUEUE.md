@@ -196,16 +196,17 @@ Command templates are arbitrary shell commands with typed placeholders:
 
 Supported placeholder types:
 
-- `{name:file}`: one file path. If the selected value is a folder, it recursively expands over every file in the folder and generates one command per file.
-- `{name:folder}`: one folder path used as-is. It does not recursively expand files.
-- `{name:text}`, `{name:name}`, or `{name}`: plain text.
+- `{name:file}`: one file path per line. If a line is a folder, it recursively expands over every file in that folder.
+- `{name:folder}`: one folder path per line. Folder paths are used as-is and do not recursively expand files.
+- `{name:text}`, `{name:name}`, or `{name}`: one plain text value per line.
 
 Rules:
 
 - Multiple placeholders can be used in one template.
 - Placeholder names may contain spaces or dashes, such as `{worker type:name}` and `{queue-dir:folder}`.
 - The same placeholder can be reused multiple times.
-- Only one `file` placeholder may recursively expand from a selected folder in a single generation.
+- Every non-empty placeholder line is one expansion value.
+- If multiple placeholders have multiple values, preview and submit generate the Cartesian product of those values.
 - Paths are resolved under the repository root; paths outside the repo are rejected.
 - Folder expansion includes every regular file found recursively.
 
@@ -215,11 +216,11 @@ Example:
 /usr/bin/python queue/submit.py --queue-dir {queue-dir:folder} --type {worker type:name} -- {command:name}
 ```
 
-The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. If one file placeholder points to a folder, preview and submit expand it into one command per recursive file. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status and task-detail pages refresh every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
+The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. Long command templates can be scrolled horizontally, and pressing Tab inside the command template inserts a tab character. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status and task-detail pages refresh every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
 
 The task table supports selecting multiple tasks and deleting them from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action.
 
-If a file placeholder is set to `config/experiment/`, submission generates one task per file under that folder.
+If a file placeholder line is set to `config/experiment/`, submission generates one task per file under that folder.
 
 ## Saved Templates
 
