@@ -70,6 +70,8 @@ def worker_loop(args: argparse.Namespace) -> int:
         )
         if args.once:
             return 0
+        if not args.forever and not claimed and db.count_active_tasks(queue_dir=args.queue_dir, worker_type=args.worker_type) == 0:
+            return 0
         if not claimed:
             time.sleep(args.poll_sec)
 
@@ -79,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--queue-dir", default=str(db.default_queue_dir()))
     parser.add_argument("--type", dest="worker_type", default=db.DEFAULT_WORKER_TYPE)
     parser.add_argument("--poll-sec", type=float, default=5.0)
-    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--once", action="store_true", help="Try at most one task, then exit.")
+    parser.add_argument("--forever", action="store_true", help="Keep polling forever, even when this worker type has no active jobs.")
     parser.add_argument("--worker-id", default=None)
     return parser
 

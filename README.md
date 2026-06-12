@@ -48,7 +48,7 @@ When changing queue code from inside the parent project, commit and push inside 
 
 ```bash
 python queue/submit.py -- echo hello
-python queue/worker.py --once
+python queue/worker.py
 ```
 
 The submitted task ID is printed by `submit.py`. stdout and stderr are written to `queue/data/log/<task_id>.out` and `queue/data/log/<task_id>.err`.
@@ -63,9 +63,7 @@ python queue/submit.py --type PREPROCESS --splits 3 -- \
 Run workers:
 
 ```bash
-python queue/worker.py --type PREPROCESS --once
-python queue/worker.py --type PREPROCESS --once
-python queue/worker.py --type PREPROCESS --once
+python queue/worker.py --type PREPROCESS
 ```
 
 For a real preprocessing script, use the same placeholders:
@@ -95,7 +93,7 @@ Open:
 http://127.0.0.1:8765
 ```
 
-The web UI can generate arbitrary shell commands from templates, copy them, submit them directly to the SQLite queue, and view the task table and logs. Queue status pages refresh every 5 seconds by default, with an interval field that can be changed or set to 0 to disable refresh. Template selection opens a popup with hard-coded submit/worker examples first, then JSON templates from `queue/data/template/`.
+The web UI can generate arbitrary shell commands from templates, copy them, submit them directly to the SQLite queue, and view the task table and logs. Queue status pages refresh every 5 seconds by default, with an interval field that can be changed or set to 0 to disable refresh. The task table supports selecting and deleting multiple non-running tasks. Template selection opens a popup with hard-coded submit/worker examples first, then JSON templates from `queue/data/template/`.
 
 Template placeholders:
 
@@ -150,10 +148,16 @@ Run a worker:
 python queue/worker.py [--queue-dir queue/data] [--type BASE] [--poll-sec 5]
 ```
 
-Run at most one task, useful for tests and manual execution:
+By default, the worker drains all pending/running jobs for its worker type and exits. Run at most one task, useful for tests and manual execution:
 
 ```bash
 python queue/worker.py --once
+```
+
+Keep polling forever:
+
+```bash
+python queue/worker.py --forever
 ```
 
 ### `db.py`
@@ -165,6 +169,8 @@ Important internal helpers:
 - `claim_next_task(worker_type, worker_id, ...)`: atomically claim one pending task.
 - `finish_task(task_id, state, return_code, ...)`: mark a running task as `done` or `failed`.
 - `cancel_task(task_id, ...)`: cancel a pending task.
+- `delete_tasks(task_ids, ...)`: remove selected non-running tasks and their events.
 - `get_task(task_id, ...)`: read one task row.
+- `count_active_tasks(worker_type, ...)`: count pending/running tasks for worker drain mode.
 - `list_tasks(...)`: list task rows.
 - `list_events(task_id, ...)`: list state-history events for one task.

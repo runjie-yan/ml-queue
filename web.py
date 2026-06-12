@@ -478,6 +478,8 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/submit":
             self.write_html("Submitted Commands", self.submit_page(self.read_post()))
+        elif parsed.path == "/delete-tasks":
+            self.write_html("Queue Tasks", self.delete_tasks_page(self.read_post()))
         elif parsed.path == "/api/preview":
             self.api_preview()
         elif parsed.path == "/api/save-template":
@@ -625,20 +627,49 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         return f'<h2>Submitted Commands</h2><pre id="all-shell-commands">{html.escape(commands)}</pre><button onclick="copyText(\'all-shell-commands\')">Copy All Shell Commands</button>'
 
     def tasks_page(self, params: dict[str, list[str]]) -> str:
+        message = params.get("message", [""])[0]
         state = params.get("state", [""])[0] or None
         worker_type = params.get("type", [""])[0] or None
         rows = []
         for task in db.list_tasks(queue_dir=self.queue_dir, state=state, worker_type=worker_type):
             command = shorten(str(task["command"]), 120)
+            disabled = " disabled" if task["state"] == "running" else ""
             rows.append(
-                f'<tr><td><a href="/task?{urlencode({"id": task["id"]})}">{html.escape(task["id"])}</a></td><td>{html.escape(task["state"])}</td><td>{html.escape(task["worker_type"])}</td><td>{html.escape(str(task["return_code"])) if task["return_code"] is not None else ""}</td><td>{html.escape(command)}</td></tr>'
+                f'<tr><td><input type="checkbox" name="task_id" value="{html.escape(task["id"])}"{disabled}></td><td><a href="/task?{urlencode({"id": task["id"]})}">{html.escape(task["id"])}</a></td><td>{html.escape(task["state"])}</td><td>{html.escape(task["worker_type"])}</td><td>{html.escape(str(task["return_code"])) if task["return_code"] is not None else ""}</td><td>{html.escape(command)}</td></tr>'
             )
+        hidden_filters = "".join(
+            f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
+            for key in ("state", "type", "refresh")
+            for value in params.get(key, [])
+            if value
+        )
+        message_html = f'<p>{html.escape(message)}</p>' if message else ""
         return f"""
 <h1>Tasks</h1>
+{message_html}
 {refresh_controls("/tasks", params)}
 <form method="get" action="/tasks" class="surface"><label>State</label><input name="state" value="{html.escape(state or "")}"><label>Worker Type</label><input name="type" value="{html.escape(worker_type or "")}"><button type="submit">Filter</button></form>
-<table><thead><tr><th>ID</th><th>State</th><th>Type</th><th>RC</th><th>Command</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+<form method="post" action="/delete-tasks">
+{hidden_filters}
+<div class="actions"><button type="submit" class="danger">Delete Selected</button><span class="muted">Running tasks cannot be deleted from this view.</span></div>
+<table><thead><tr><th>Select</th><th>ID</th><th>State</th><th>Type</th><th>RC</th><th>Command</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+</form>
 """
+
+    def delete_tasks_page(self, params: dict[str, list[str]]) -> str:
+        result = db.delete_tasks(params.get("task_id", []), queue_dir=self.queue_dir)
+        parts = [f"Deleted {result['deleted']} of {result['requested']} selected task(s)."]
+        if result["skipped_running"]:
+            parts.append(f"Skipped {result['skipped_running']} running task(s).")
+        if result["missing"]:
+            parts.append(f"{result['missing']} task(s) were already missing.")
+        next_params = {
+            key: values
+            for key, values in params.items()
+            if key in {"state", "type", "refresh"}
+        }
+        next_params["message"] = [" ".join(parts)]
+        return self.tasks_page(next_params)
 
     def task_page(self, params: dict[str, list[str]]) -> str:
         task_id = params.get("id", [""])[0]

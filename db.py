@@ -224,6 +224,25 @@ def list_tasks(
     return [dict(row) for row in rows]
 
 
+def count_active_tasks(
+    *,
+    queue_dir: str | os.PathLike[str] | None = None,
+    worker_type: str = DEFAULT_WORKER_TYPE,
+) -> int:
+    init_db(queue_dir)
+    with connect(queue_dir) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM tasks
+            WHERE worker_type = ?
+              AND state IN ('pending', 'running')
+            """,
+            (worker_type,),
+        ).fetchone()
+    return int(row["count"])
+
+
 def claim_next_task(
     *,
     queue_dir: str | os.PathLike[str] | None = None,
@@ -341,6 +360,42 @@ def cancel_task(task_id: str, *, queue_dir: str | os.PathLike[str] | None = None
                 message="canceled",
             )
     return cursor.rowcount == 1
+
+
+def delete_tasks(
+    task_ids: list[str],
+    *,
+    queue_dir: str | os.PathLike[str] | None = None,
+    allow_running: bool = False,
+) -> dict[str, int]:
+    init_db(queue_dir)
+    requested = len([task_id for task_id in task_ids if task_id])
+    if requested == 0:
+        return {"requested": 0, "deleted": 0, "skipped_running": 0, "missing": 0}
+
+    deleted = 0
+    skipped_running = 0
+    missing = 0
+    with connect(queue_dir) as conn:
+        for task_id in task_ids:
+            if not task_id:
+                continue
+            row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                missing += 1
+                continue
+            if row["state"] == "running" and not allow_running:
+                skipped_running += 1
+                continue
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            deleted += cursor.rowcount
+    return {
+        "requested": requested,
+        "deleted": deleted,
+        "skipped_running": skipped_running,
+        "missing": missing,
+    }
 
 
 def list_events(

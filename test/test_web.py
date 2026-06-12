@@ -268,6 +268,31 @@ class WebSubmissionTest(unittest.TestCase):
         self.assertIn('<meta http-equiv="refresh" content="5">', body)
         self.assertIn(f'name="id" value="{task_id}"', body)
 
+    def test_tasks_page_has_multi_select_delete_form(self) -> None:
+        task_id = db.submit_task("echo delete-me", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+        body = handler_instance.tasks_page({})
+
+        self.assertIn('action="/delete-tasks"', body)
+        self.assertIn(f'name="task_id" value="{task_id}"', body)
+        self.assertIn("Delete Selected", body)
+
+    def test_delete_tasks_page_deletes_selected_tasks_and_preserves_filters(self) -> None:
+        task_id = db.submit_task("echo delete-me", queue_dir=self.queue_dir, worker_type="TRAIN", cwd=str(REPO_ROOT))
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+        body = handler_instance.delete_tasks_page({
+            "task_id": [task_id],
+            "type": ["TRAIN"],
+            "refresh": ["0"],
+        })
+
+        self.assertIsNone(db.get_task(task_id, queue_dir=self.queue_dir))
+        self.assertIn("Deleted 1 of 1 selected task", body)
+        self.assertIn('name="type" value="TRAIN"', body)
+        self.assertIn('name="refresh" type="number" min="0" value="0"', body)
+
 
 if __name__ == "__main__":
     unittest.main()

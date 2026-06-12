@@ -36,7 +36,7 @@ class QueueSmokeTest(unittest.TestCase):
 
     def run_worker(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(WORKER), "--queue-dir", str(self.queue_dir), "--once", *args],
+            [sys.executable, str(WORKER), "--queue-dir", str(self.queue_dir), *args],
             cwd=REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -134,10 +134,40 @@ class QueueSmokeTest(unittest.TestCase):
         base_id = self.submitted_id(self.run_submit("--", "echo", "base"))
         other_id = self.submitted_id(self.run_submit("--type", "PREPROCESS", "--", "echo", "pre"))
 
-        self.run_worker("--type", "PREPROCESS")
+        self.run_worker("--type", "PREPROCESS", "--once")
 
         self.assertEqual(db.get_task(base_id, queue_dir=self.queue_dir)["state"], "pending")
         self.assertEqual(db.get_task(other_id, queue_dir=self.queue_dir)["state"], "done")
+
+    def test_delete_tasks_removes_non_running_tasks_and_events(self) -> None:
+        first_id = self.submitted_id(self.run_submit("--", "echo", "delete-a"))
+        second_id = self.submitted_id(self.run_submit("--", "echo", "delete-b"))
+        running = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type=db.DEFAULT_WORKER_TYPE,
+            worker_id="worker-a",
+        )
+        self.assertEqual(running["id"], first_id)
+
+        result = db.delete_tasks([first_id, second_id, "missing"], queue_dir=self.queue_dir)
+
+        self.assertEqual(result["requested"], 3)
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["skipped_running"], 1)
+        self.assertEqual(result["missing"], 1)
+        self.assertIsNotNone(db.get_task(first_id, queue_dir=self.queue_dir))
+        self.assertIsNone(db.get_task(second_id, queue_dir=self.queue_dir))
+        self.assertEqual(db.list_events(second_id, queue_dir=self.queue_dir), [])
+
+    def test_default_worker_drains_type_and_exits(self) -> None:
+        first_id = self.submitted_id(self.run_submit("--", "echo", "one"))
+        second_id = self.submitted_id(self.run_submit("--", "echo", "two"))
+
+        self.run_worker()
+
+        self.assertEqual(db.get_task(first_id, queue_dir=self.queue_dir)["state"], "done")
+        self.assertEqual(db.get_task(second_id, queue_dir=self.queue_dir)["state"], "done")
+        self.assertEqual(db.count_active_tasks(queue_dir=self.queue_dir, worker_type=db.DEFAULT_WORKER_TYPE), 0)
 
 
 if __name__ == "__main__":

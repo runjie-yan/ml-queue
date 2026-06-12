@@ -71,6 +71,13 @@ Split placeholders:
 
 ## Worker
 
+Run all active jobs for a worker type and exit:
+
+```bash
+python queue/worker.py
+python queue/worker.py --type PREPROCESS
+```
+
 Run one task and exit:
 
 ```bash
@@ -81,7 +88,7 @@ python queue/worker.py --type PREPROCESS --once
 Run continuously:
 
 ```bash
-python queue/worker.py --type PREPROCESS --poll-sec 2
+python queue/worker.py --type PREPROCESS --poll-sec 2 --forever
 ```
 
 Worker behavior:
@@ -209,6 +216,8 @@ Example:
 ```
 
 The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. If one file placeholder points to a folder, preview and submit expand it into one command per recursive file. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status and task-detail pages refresh every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
+
+The task table supports selecting multiple tasks and deleting them from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action.
 
 If a file placeholder is set to `config/experiment/`, submission generates one task per file under that folder.
 
