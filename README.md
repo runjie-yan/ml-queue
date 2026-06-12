@@ -16,7 +16,7 @@ queue/data/log/
 Use it as a standalone repo:
 
 ```bash
-git clone git@github.com:<USER_OR_ORG>/ml-queue.git
+git clone git@github.com:runjie-yan/ml-queue.git
 cd ml-queue
 python submit.py -- echo hello
 python worker.py --once
@@ -26,14 +26,14 @@ Use it as a submodule inside another ML project:
 
 ```bash
 cd /path/to/your/ml-project
-git submodule add git@github.com:<USER_OR_ORG>/ml-queue.git queue
+git submodule add git@github.com:runjie-yan/ml-queue.git queue
 git commit -m "Add ml-queue submodule"
 ```
 
 Clone the ML project later with:
 
 ```bash
-git clone --recurse-submodules git@github.com:<USER_OR_ORG>/<ML_PROJECT>.git
+git clone --recurse-submodules git@github.com:runjie-yan/ml-queue.git
 ```
 
 For an existing clone:
