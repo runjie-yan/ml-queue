@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any
 
 DEFAULT_WORKER_TYPE = "BASE"
 TASK_STATES = {"pending", "running", "done", "failed", "canceled"}
+SQLITE_BUSY_TIMEOUT_MS = 30000
+LOCK_RETRY_SECONDS = 60.0
 
 
 def default_queue_dir() -> Path:
@@ -51,63 +54,90 @@ def ensure_layout(queue_dir: str | os.PathLike[str] | None = None) -> Path:
 
 def connect(queue_dir: str | os.PathLike[str] | None = None) -> sqlite3.Connection:
     ensure_layout(queue_dir)
-    conn = sqlite3.connect(db_path(queue_dir), timeout=5)
+    conn = sqlite3.connect(db_path(queue_dir), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     return conn
 
 
+def is_locked_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+def retry_locked(operation: Any, *, seconds: float = LOCK_RETRY_SECONDS) -> Any:
+    deadline = time.monotonic() + seconds
+    delay = 0.05
+    while True:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.5, 1.0)
+
+
 def init_db(queue_dir: str | os.PathLike[str] | None = None) -> None:
-    with connect(queue_dir) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                state TEXT NOT NULL,
-                worker_type TEXT NOT NULL,
-                command TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                split_id INTEGER,
-                split_count INTEGER,
-                params_json TEXT NOT NULL DEFAULT '{}',
-                worker_id TEXT,
-                started_at TEXT,
-                finished_at TEXT,
-                return_code INTEGER,
-                stdout_path TEXT NOT NULL,
-                stderr_path TEXT NOT NULL,
-                error TEXT
+    def operation() -> None:
+        with connect(queue_dir) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    worker_type TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    split_id INTEGER,
+                    split_count INTEGER,
+                    params_json TEXT NOT NULL DEFAULT '{}',
+                    worker_id TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    return_code INTEGER,
+                    stdout_path TEXT NOT NULL,
+                    stderr_path TEXT NOT NULL,
+                    error TEXT
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_tasks_state_type_created
-            ON tasks(state, worker_type, created_at ASC)
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS task_events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT NOT NULL,
-                ts TEXT NOT NULL,
-                from_state TEXT,
-                to_state TEXT NOT NULL,
-                worker_id TEXT,
-                message TEXT,
-                FOREIGN KEY(task_id) REFERENCES tasks(id)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_state_type_created
+                ON tasks(state, worker_type, created_at ASC)
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_task_events_task_ts
-            ON task_events(task_id, ts ASC, event_id ASC)
-            """
-        )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT NOT NULL,
+                    worker_id TEXT,
+                    message TEXT,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_events_task_ts
+                ON task_events(task_id, ts ASC, event_id ASC)
+                """
+            )
+
+    retry_locked(operation)
+
+
+def init_db_if_missing(queue_dir: str | os.PathLike[str] | None = None) -> None:
+    root = ensure_layout(queue_dir)
+    if not db_path(root).exists():
+        init_db(root)
 
 
 def record_event(
@@ -150,7 +180,7 @@ def submit_task(
     if not command.strip():
         raise ValueError("command must not be empty")
 
-    init_db(queue_dir)
+    init_db_if_missing(queue_dir)
     root = resolve_queue_dir(queue_dir)
     task_id = task_id or make_task_id()
     timestamp = now_iso()
@@ -158,43 +188,50 @@ def submit_task(
     stderr_path = log_dir(root) / f"{task_id}.err"
     task_cwd = Path(cwd).resolve() if cwd else default_cwd()
 
-    with connect(root) as conn:
-        conn.execute(
-            """
-            INSERT INTO tasks (
-                id, created_at, updated_at, state, worker_type, command, cwd,
-                split_id, split_count, params_json, stdout_path, stderr_path
+    def operation() -> None:
+        with connect(root) as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, created_at, updated_at, state, worker_type, command, cwd,
+                    split_id, split_count, params_json, stdout_path, stderr_path
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    timestamp,
+                    timestamp,
+                    worker_type,
+                    command,
+                    str(task_cwd),
+                    split_id,
+                    split_count,
+                    json.dumps(params or {}, sort_keys=True),
+                    str(stdout_path),
+                    str(stderr_path),
+                ),
             )
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                timestamp,
-                timestamp,
-                worker_type,
-                command,
-                str(task_cwd),
-                split_id,
-                split_count,
-                json.dumps(params or {}, sort_keys=True),
-                str(stdout_path),
-                str(stderr_path),
-            ),
-        )
-        record_event(
-            conn,
-            task_id=task_id,
-            from_state=None,
-            to_state="pending",
-            message="submitted",
-        )
+            record_event(
+                conn,
+                task_id=task_id,
+                from_state=None,
+                to_state="pending",
+                message="submitted",
+            )
+
+    retry_locked(operation)
     return task_id
 
 
 def get_task(task_id: str, *, queue_dir: str | os.PathLike[str] | None = None) -> dict[str, Any] | None:
-    init_db(queue_dir)
-    with connect(queue_dir) as conn:
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    init_db_if_missing(queue_dir)
+
+    def operation() -> sqlite3.Row | None:
+        with connect(queue_dir) as conn:
+            return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+    row = retry_locked(operation)
     return row_to_dict(row)
 
 
@@ -204,7 +241,7 @@ def list_tasks(
     state: str | None = None,
     worker_type: str | None = None,
 ) -> list[dict[str, Any]]:
-    init_db(queue_dir)
+    init_db_if_missing(queue_dir)
     clauses = []
     params: list[Any] = []
     if state:
@@ -219,8 +256,11 @@ def list_tasks(
         {where}
         ORDER BY created_at ASC, split_id ASC, id ASC
     """
-    with connect(queue_dir) as conn:
-        rows = conn.execute(query, params).fetchall()
+    def operation() -> list[sqlite3.Row]:
+        with connect(queue_dir) as conn:
+            return conn.execute(query, params).fetchall()
+
+    rows = retry_locked(operation)
     return [dict(row) for row in rows]
 
 
@@ -229,17 +269,21 @@ def count_active_tasks(
     queue_dir: str | os.PathLike[str] | None = None,
     worker_type: str = DEFAULT_WORKER_TYPE,
 ) -> int:
-    init_db(queue_dir)
-    with connect(queue_dir) as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM tasks
-            WHERE worker_type = ?
-              AND state IN ('pending', 'running')
-            """,
-            (worker_type,),
-        ).fetchone()
+    init_db_if_missing(queue_dir)
+
+    def operation() -> sqlite3.Row:
+        with connect(queue_dir) as conn:
+            return conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM tasks
+                WHERE worker_type = ?
+                  AND state IN ('pending', 'running')
+                """,
+                (worker_type,),
+            ).fetchone()
+
+    row = retry_locked(operation)
     return int(row["count"])
 
 
@@ -249,59 +293,63 @@ def claim_next_task(
     worker_type: str = DEFAULT_WORKER_TYPE,
     worker_id: str,
 ) -> dict[str, Any] | None:
-    init_db(queue_dir)
-    timestamp = now_iso()
-    conn = connect(queue_dir)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            """
-            SELECT id
-            FROM tasks
-            WHERE state = 'pending'
-              AND worker_type = ?
-            ORDER BY created_at ASC, id ASC
-            LIMIT 1
-            """,
-            (worker_type,),
-        ).fetchone()
-        if row is None:
+    init_db_if_missing(queue_dir)
+
+    def operation() -> dict[str, Any] | None:
+        timestamp = now_iso()
+        conn = connect(queue_dir)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id
+                FROM tasks
+                WHERE state = 'pending'
+                  AND worker_type = ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (worker_type,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+
+            task_id = row["id"]
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET state = 'running',
+                    worker_id = ?,
+                    started_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND state = 'pending'
+                """,
+                (worker_id, timestamp, timestamp, task_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+
+            record_event(
+                conn,
+                task_id=task_id,
+                from_state="pending",
+                to_state="running",
+                worker_id=worker_id,
+                message="claimed",
+            )
+            task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             conn.commit()
-            return None
-
-        task_id = row["id"]
-        cursor = conn.execute(
-            """
-            UPDATE tasks
-            SET state = 'running',
-                worker_id = ?,
-                started_at = ?,
-                updated_at = ?
-            WHERE id = ?
-              AND state = 'pending'
-            """,
-            (worker_id, timestamp, timestamp, task_id),
-        )
-        if cursor.rowcount != 1:
+            return row_to_dict(task)
+        except Exception:
             conn.rollback()
-            return None
+            raise
+        finally:
+            conn.close()
 
-        record_event(
-            conn,
-            task_id=task_id,
-            from_state="pending",
-            to_state="running",
-            worker_id=worker_id,
-            message="claimed",
-        )
-        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        conn.commit()
-        return row_to_dict(task)
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return retry_locked(operation)
 
 
 def finish_task(
@@ -314,52 +362,61 @@ def finish_task(
 ) -> None:
     if state not in {"done", "failed"}:
         raise ValueError("finish_task state must be 'done' or 'failed'")
-    timestamp = now_iso()
-    with connect(queue_dir) as conn:
-        conn.execute(
-            """
-            UPDATE tasks
-            SET state = ?,
-                updated_at = ?,
-                finished_at = ?,
-                return_code = ?,
-                error = ?
-            WHERE id = ?
-            """,
-            (state, timestamp, timestamp, return_code, error, task_id),
-        )
-        record_event(
-            conn,
-            task_id=task_id,
-            from_state="running",
-            to_state=state,
-            message=error or f"return_code={return_code}",
-        )
+    init_db_if_missing(queue_dir)
 
-
-def cancel_task(task_id: str, *, queue_dir: str | os.PathLike[str] | None = None) -> bool:
-    init_db(queue_dir)
-    timestamp = now_iso()
-    with connect(queue_dir) as conn:
-        cursor = conn.execute(
-            """
-            UPDATE tasks
-            SET state = 'canceled',
-                updated_at = ?
-            WHERE id = ?
-              AND state = 'pending'
-            """,
-            (timestamp, task_id),
-        )
-        if cursor.rowcount == 1:
+    def operation() -> None:
+        timestamp = now_iso()
+        with connect(queue_dir) as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET state = ?,
+                    updated_at = ?,
+                    finished_at = ?,
+                    return_code = ?,
+                    error = ?
+                WHERE id = ?
+                """,
+                (state, timestamp, timestamp, return_code, error, task_id),
+            )
             record_event(
                 conn,
                 task_id=task_id,
-                from_state="pending",
-                to_state="canceled",
-                message="canceled",
+                from_state="running",
+                to_state=state,
+                message=error or f"return_code={return_code}",
             )
-    return cursor.rowcount == 1
+
+    retry_locked(operation)
+
+
+def cancel_task(task_id: str, *, queue_dir: str | os.PathLike[str] | None = None) -> bool:
+    init_db_if_missing(queue_dir)
+
+    def operation() -> bool:
+        timestamp = now_iso()
+        with connect(queue_dir) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET state = 'canceled',
+                    updated_at = ?
+                WHERE id = ?
+                  AND state = 'pending'
+                """,
+                (timestamp, task_id),
+            )
+            if cursor.rowcount == 1:
+                record_event(
+                    conn,
+                    task_id=task_id,
+                    from_state="pending",
+                    to_state="canceled",
+                    message="canceled",
+                )
+            return cursor.rowcount == 1
+
+    return retry_locked(operation)
 
 
 def delete_tasks(
@@ -368,34 +425,37 @@ def delete_tasks(
     queue_dir: str | os.PathLike[str] | None = None,
     allow_running: bool = False,
 ) -> dict[str, int]:
-    init_db(queue_dir)
+    init_db_if_missing(queue_dir)
     requested = len([task_id for task_id in task_ids if task_id])
     if requested == 0:
         return {"requested": 0, "deleted": 0, "skipped_running": 0, "missing": 0}
 
-    deleted = 0
-    skipped_running = 0
-    missing = 0
-    with connect(queue_dir) as conn:
-        for task_id in task_ids:
-            if not task_id:
-                continue
-            row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
-            if row is None:
-                missing += 1
-                continue
-            if row["state"] == "running" and not allow_running:
-                skipped_running += 1
-                continue
-            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            deleted += cursor.rowcount
-    return {
-        "requested": requested,
-        "deleted": deleted,
-        "skipped_running": skipped_running,
-        "missing": missing,
-    }
+    def operation() -> dict[str, int]:
+        deleted = 0
+        skipped_running = 0
+        missing = 0
+        with connect(queue_dir) as conn:
+            for task_id in task_ids:
+                if not task_id:
+                    continue
+                row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is None:
+                    missing += 1
+                    continue
+                if row["state"] == "running" and not allow_running:
+                    skipped_running += 1
+                    continue
+                conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+                cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                deleted += cursor.rowcount
+        return {
+            "requested": requested,
+            "deleted": deleted,
+            "skipped_running": skipped_running,
+            "missing": missing,
+        }
+
+    return retry_locked(operation)
 
 
 def list_events(
@@ -403,15 +463,19 @@ def list_events(
     *,
     queue_dir: str | os.PathLike[str] | None = None,
 ) -> list[dict[str, Any]]:
-    init_db(queue_dir)
-    with connect(queue_dir) as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM task_events
-            WHERE task_id = ?
-            ORDER BY ts ASC, event_id ASC
-            """,
-            (task_id,),
-        ).fetchall()
+    init_db_if_missing(queue_dir)
+
+    def operation() -> list[sqlite3.Row]:
+        with connect(queue_dir) as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM task_events
+                WHERE task_id = ?
+                ORDER BY ts ASC, event_id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+
+    rows = retry_locked(operation)
     return [dict(row) for row in rows]

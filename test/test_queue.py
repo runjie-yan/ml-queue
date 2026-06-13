@@ -169,6 +169,41 @@ class QueueSmokeTest(unittest.TestCase):
         self.assertEqual(db.get_task(second_id, queue_dir=self.queue_dir)["state"], "done")
         self.assertEqual(db.count_active_tasks(queue_dir=self.queue_dir, worker_type=db.DEFAULT_WORKER_TYPE), 0)
 
+    def test_many_once_workers_do_not_crash_on_sqlite_lock_contention(self) -> None:
+        for index in range(24):
+            db.submit_task(f"echo {index}", queue_dir=self.queue_dir, cwd=REPO_ROOT)
+
+        workers = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(WORKER),
+                    "--queue-dir",
+                    str(self.queue_dir),
+                    "--worker-id",
+                    f"worker-{index}",
+                    "--once",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for index in range(48)
+        ]
+
+        failures = []
+        for index, process in enumerate(workers):
+            stdout, stderr = process.communicate(timeout=30)
+            if process.returncode != 0:
+                failures.append((index, process.returncode, stdout, stderr))
+
+        self.assertEqual(failures, [])
+        tasks = db.list_tasks(queue_dir=self.queue_dir)
+        self.assertEqual(len(tasks), 24)
+        self.assertEqual({task["state"] for task in tasks}, {"done"})
+        self.assertEqual(len({task["id"] for task in tasks}), 24)
+
 
 if __name__ == "__main__":
     unittest.main()
