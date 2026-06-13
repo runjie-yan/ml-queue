@@ -303,7 +303,7 @@ def claim_next_task(
             row = conn.execute(
                 """
                 SELECT id
-                FROM tasks
+                FROM tasks NOT INDEXED
                 WHERE state = 'pending'
                   AND worker_type = ?
                 ORDER BY created_at ASC, id ASC

@@ -113,6 +113,25 @@ class QueueSmokeTest(unittest.TestCase):
         self.assertEqual(first["id"], task_id)
         self.assertIsNone(second)
 
+    def test_claim_skips_running_task_for_same_type(self) -> None:
+        running_id = self.submitted_id(self.run_submit("--type", "TRAIN", "--", "echo", "running"))
+        pending_id = self.submitted_id(self.run_submit("--type", "TRAIN", "--", "echo", "pending"))
+        running = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type="TRAIN",
+            worker_id="worker-a",
+        )
+        self.assertEqual(running["id"], running_id)
+
+        claimed = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type="TRAIN",
+            worker_id="worker-b",
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], pending_id)
+
     def test_submit_splits_creates_split_tasks(self) -> None:
         result = self.run_submit(
             "--splits",
