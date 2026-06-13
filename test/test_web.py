@@ -286,15 +286,18 @@ class WebSubmissionTest(unittest.TestCase):
         handler_instance = object.__new__(handler)
         body = handler_instance.tasks_page({})
 
-        self.assertIn('<meta http-equiv="refresh" content="5">', body)
-        self.assertIn('name="refresh" type="number" min="0" value="5"', body)
+        self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn('name="refresh" type="number" min="0" value="5" data-refresh-seconds', body)
+        self.assertIn('id="task-list-data"', body)
+        self.assertIn("startPartialRefresh", web.page("Queue Tasks", body).decode("utf-8"))
 
     def test_tasks_page_refresh_interval_can_be_changed_or_disabled(self) -> None:
         handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
         handler_instance = object.__new__(handler)
 
         custom = handler_instance.tasks_page({"refresh": ["2"], "state": ["running"]})
-        self.assertIn('<meta http-equiv="refresh" content="2">', custom)
+        self.assertNotIn('http-equiv="refresh"', custom)
+        self.assertIn('data-refresh-seconds', custom)
         self.assertIn('name="state" value="running"', custom)
 
         disabled = handler_instance.tasks_page({"refresh": ["0"]})
@@ -307,8 +310,34 @@ class WebSubmissionTest(unittest.TestCase):
         handler_instance = object.__new__(handler)
         body = handler_instance.task_page({"id": [task_id]})
 
-        self.assertIn('<meta http-equiv="refresh" content="5">', body)
+        self.assertNotIn('http-equiv="refresh"', body)
         self.assertIn(f'name="id" value="{task_id}"', body)
+        self.assertIn('id="task-detail-data"', body)
+
+    def test_tasks_page_headers_are_sort_links_and_toggle_order(self) -> None:
+        db.submit_task("echo b", queue_dir=self.queue_dir, worker_type="B", cwd=str(REPO_ROOT))
+        db.submit_task("echo a", queue_dir=self.queue_dir, worker_type="A", cwd=str(REPO_ROOT))
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+
+        body = handler_instance.tasks_page({"sort": ["type"], "order": ["asc"], "refresh": ["0"]})
+
+        self.assertIn("sort=type&amp;order=desc", body)
+        self.assertIn("Type ^", body)
+        self.assertIn("sort=state&amp;order=asc", body)
+        self.assertLess(body.index(">A<"), body.index(">B<"))
+
+    def test_task_list_api_fragment_uses_same_sorted_table(self) -> None:
+        db.submit_task("echo b", queue_dir=self.queue_dir, worker_type="B", cwd=str(REPO_ROOT))
+        db.submit_task("echo a", queue_dir=self.queue_dir, worker_type="A", cwd=str(REPO_ROOT))
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+
+        body = handler_instance.tasks_data_html({"sort": ["command"], "order": ["asc"]})
+
+        self.assertIn('action="/delete-tasks"', body)
+        self.assertIn("Command ^", body)
+        self.assertLess(body.index("echo a"), body.index("echo b"))
 
     def test_tasks_page_has_multi_select_delete_form(self) -> None:
         task_id = db.submit_task("echo delete-me", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))
@@ -317,8 +346,29 @@ class WebSubmissionTest(unittest.TestCase):
         body = handler_instance.tasks_page({})
 
         self.assertIn('action="/delete-tasks"', body)
+        self.assertIn('id="select-all-tasks"', body)
         self.assertIn(f'name="task_id" value="{task_id}"', body)
         self.assertIn("Delete Selected", body)
+        full_page = web.page("Queue Tasks", body).decode("utf-8")
+        self.assertIn("toggleAllTasks", full_page)
+        self.assertIn("syncSelectAll", full_page)
+
+    def test_running_tasks_are_not_selected_by_select_all(self) -> None:
+        running_id = db.submit_task("echo running", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))
+        pending_id = db.submit_task("echo pending", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))
+        claimed = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type=db.DEFAULT_WORKER_TYPE,
+            worker_id="test-worker",
+        )
+        self.assertEqual(claimed["id"], running_id)
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+
+        body = handler_instance.tasks_data_html({})
+
+        self.assertIn(f'name="task_id" value="{running_id}" disabled', body)
+        self.assertIn(f'name="task_id" value="{pending_id}"', body)
 
     def test_delete_tasks_page_deletes_selected_tasks_and_preserves_filters(self) -> None:
         task_id = db.submit_task("echo delete-me", queue_dir=self.queue_dir, worker_type="TRAIN", cwd=str(REPO_ROOT))

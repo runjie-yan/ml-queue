@@ -19,6 +19,13 @@ PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([A-Za-z0-9_][A-Za-z0-9_ -]*?)(?::(file|f
 TEMPLATE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 LOG_TAIL_BYTES = 64 * 1024
 DEFAULT_REFRESH_SEC = 5
+TASK_SORT_KEYS = {
+    "id": "ID",
+    "type": "Type",
+    "state": "State",
+    "rc": "RC",
+    "command": "Command",
+}
 
 BUILTIN_TEMPLATES = [
     {
@@ -270,17 +277,56 @@ def refresh_controls(path: str, params: dict[str, list[str]]) -> str:
             continue
         for value in values:
             hidden_inputs.append(f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">')
-    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh > 0 else ""
     return f"""
-{meta}
 <form method="get" action="{html.escape(path)}" class="surface refresh-control">
   {''.join(hidden_inputs)}
   <label>Refresh Interval Seconds</label>
-  <input name="refresh" type="number" min="0" value="{html.escape(str(refresh))}">
+  <input name="refresh" type="number" min="0" value="{html.escape(str(refresh))}" data-refresh-seconds>
   <button type="submit">Apply</button>
   <span class="muted">Set to 0 to disable auto refresh.</span>
 </form>
 """
+
+
+def first_param(params: dict[str, list[str]], key: str, default: str = "") -> str:
+    values = params.get(key)
+    return values[0] if values else default
+
+
+def sort_params(params: dict[str, list[str]]) -> tuple[str, str]:
+    key = first_param(params, "sort", "id")
+    if key not in TASK_SORT_KEYS:
+        key = "id"
+    order = first_param(params, "order", "asc").lower()
+    if order not in {"asc", "desc"}:
+        order = "asc"
+    return key, order
+
+
+def sort_tasks(tasks: list[dict[str, Any]], *, sort_key: str, order: str) -> list[dict[str, Any]]:
+    def value(task: dict[str, Any]) -> Any:
+        if sort_key == "type":
+            return str(task["worker_type"])
+        if sort_key == "state":
+            return str(task["state"])
+        if sort_key == "rc":
+            return (task["return_code"] is None, task["return_code"] if task["return_code"] is not None else 0)
+        return str(task[sort_key])
+
+    return sorted(tasks, key=value, reverse=order == "desc")
+
+
+def task_sort_link(params: dict[str, list[str]], *, key: str, label: str, current_key: str, current_order: str) -> str:
+    next_order = "desc" if key == current_key and current_order == "asc" else "asc"
+    query: dict[str, str] = {}
+    for name in ("state", "type", "refresh"):
+        value = first_param(params, name)
+        if value:
+            query[name] = value
+    query["sort"] = key
+    query["order"] = next_order
+    marker = " ^" if key == current_key and current_order == "asc" else " v" if key == current_key else ""
+    return f'<a href="/tasks?{html.escape(urlencode(query), quote=True)}">{html.escape(label + marker)}</a>'
 
 
 def submit_generated_tasks(
@@ -433,6 +479,51 @@ async function saveTemplate() {{
   if (!data.ok) {{ err.textContent = data.error; return; }}
   window.location = '/?template=' + encodeURIComponent(data.name);
 }}
+function refreshIntervalSeconds() {{
+  const input = document.querySelector('[data-refresh-seconds]');
+  if (!input) return 0;
+  const value = Number.parseInt(input.value || '0', 10);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}}
+function apiUrl(path) {{
+  const url = new URL(path, window.location.origin);
+  document.querySelectorAll('.refresh-control input[name]').forEach(input => {{
+    if (input.name !== 'refresh' && input.value) url.searchParams.append(input.name, input.value);
+  }});
+  return url.toString();
+}}
+async function refreshTaskList() {{
+  const target = document.getElementById('task-list-data');
+  if (!target) return;
+  const res = await fetch(apiUrl('/api/tasks'));
+  const data = await res.json();
+  if (data.ok) target.innerHTML = data.html;
+}}
+function syncSelectAll() {{
+  const selectAll = document.getElementById('select-all-tasks');
+  if (!selectAll) return;
+  const boxes = [...document.querySelectorAll('input[name="task_id"]:not(:disabled)')];
+  const checked = boxes.filter(box => box.checked).length;
+  selectAll.checked = boxes.length > 0 && checked === boxes.length;
+  selectAll.indeterminate = checked > 0 && checked < boxes.length;
+}}
+function toggleAllTasks(checked) {{
+  document.querySelectorAll('input[name="task_id"]:not(:disabled)').forEach(box => box.checked = checked);
+  syncSelectAll();
+}}
+async function refreshTaskDetail() {{
+  const target = document.getElementById('task-detail-data');
+  if (!target) return;
+  const res = await fetch(apiUrl('/api/task'));
+  const data = await res.json();
+  if (data.ok) target.innerHTML = data.html;
+}}
+function startPartialRefresh() {{
+  const seconds = refreshIntervalSeconds();
+  if (!seconds) return;
+  const refresh = document.getElementById('task-list-data') ? refreshTaskList : refreshTaskDetail;
+  window.setInterval(() => refresh().catch(err => console.error(err)), seconds * 1000);
+}}
 window.addEventListener('DOMContentLoaded', () => {{
   const templateText = document.getElementById('template-text');
   templateText?.addEventListener('input', refreshFields);
@@ -447,7 +538,13 @@ window.addEventListener('DOMContentLoaded', () => {{
   }});
   document.getElementById('placeholder-fields')?.addEventListener('input', updatePreview);
   document.getElementById('cwd')?.addEventListener('input', updatePreview);
+  document.addEventListener('change', event => {{
+    if (event.target?.id === 'select-all-tasks') toggleAllTasks(event.target.checked);
+    if (event.target?.name === 'task_id') syncSelectAll();
+  }});
   updatePreview();
+  startPartialRefresh();
+  syncSelectAll();
 }});
 </script>
 </head>
@@ -487,6 +584,10 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             self.write_html("Queue Tasks", self.tasks_page(params))
         elif parsed.path == "/task":
             self.write_html("Queue Task", self.task_page(params))
+        elif parsed.path == "/api/tasks":
+            self.api_tasks(params)
+        elif parsed.path == "/api/task":
+            self.api_task(params)
         else:
             self.write_html("Not Found", "<h1>Not Found</h1>", status=404)
 
@@ -605,6 +706,17 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             return
         json_response(self, {"ok": True, "name": path.stem})
 
+    def api_tasks(self, params: dict[str, list[str]]) -> None:
+        json_response(self, {"ok": True, "html": self.tasks_data_html(params)})
+
+    def api_task(self, params: dict[str, list[str]]) -> None:
+        task_id = params.get("id", [""])[0]
+        task = db.get_task(task_id, queue_dir=self.queue_dir)
+        if task is None:
+            json_response(self, {"ok": False, "error": "task not found"}, status=404)
+            return
+        json_response(self, {"ok": True, "html": self.task_detail_html(task_id)})
+
     def submit_page(self, params: dict[str, list[str]]) -> str:
         template = params.get("template", [""])[0]
         cwd = params.get("cwd", [str(self.repo_root)])[0] or str(self.repo_root)
@@ -637,34 +749,55 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         commands = "\n".join(str(item["command"]) for item in generated)
         return f'<h2>Submitted Commands</h2><pre id="all-shell-commands">{html.escape(commands)}</pre><button onclick="copyText(\'all-shell-commands\')">Copy All Shell Commands</button>'
 
-    def tasks_page(self, params: dict[str, list[str]]) -> str:
-        message = params.get("message", [""])[0]
+    def tasks_data_html(self, params: dict[str, list[str]]) -> str:
         state = params.get("state", [""])[0] or None
         worker_type = params.get("type", [""])[0] or None
+        sort_key, order = sort_params(params)
         rows = []
-        for task in db.list_tasks(queue_dir=self.queue_dir, state=state, worker_type=worker_type):
+        tasks = db.list_tasks(queue_dir=self.queue_dir, state=state, worker_type=worker_type)
+        for task in sort_tasks(tasks, sort_key=sort_key, order=order):
             command = shorten(str(task["command"]), 120)
             disabled = " disabled" if task["state"] == "running" else ""
             rows.append(
                 f'<tr><td><input type="checkbox" name="task_id" value="{html.escape(task["id"])}"{disabled}></td><td><a href="/task?{urlencode({"id": task["id"]})}">{html.escape(task["id"])}</a></td><td>{html.escape(task["state"])}</td><td>{html.escape(task["worker_type"])}</td><td>{html.escape(str(task["return_code"])) if task["return_code"] is not None else ""}</td><td>{html.escape(command)}</td></tr>'
             )
+        headers = [
+            '<th><input id="select-all-tasks" type="checkbox" title="Select all visible tasks"></th>',
+            f"<th>{task_sort_link(params, key='id', label='ID', current_key=sort_key, current_order=order)}</th>",
+            f"<th>{task_sort_link(params, key='state', label='State', current_key=sort_key, current_order=order)}</th>",
+            f"<th>{task_sort_link(params, key='type', label='Type', current_key=sort_key, current_order=order)}</th>",
+            f"<th>{task_sort_link(params, key='rc', label='RC', current_key=sort_key, current_order=order)}</th>",
+            f"<th>{task_sort_link(params, key='command', label='Command', current_key=sort_key, current_order=order)}</th>",
+        ]
         hidden_filters = "".join(
             f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
-            for key in ("state", "type", "refresh")
+            for key in ("state", "type", "refresh", "sort", "order")
             for value in params.get(key, [])
             if value
         )
+        return f"""
+<form method="post" action="/delete-tasks">
+{hidden_filters}
+<div class="actions"><button type="submit" class="danger">Delete Selected</button><span class="muted">Running tasks cannot be deleted from this view.</span></div>
+<table><thead><tr>{''.join(headers)}</tr></thead><tbody>{''.join(rows)}</tbody></table>
+</form>
+"""
+
+    def tasks_page(self, params: dict[str, list[str]]) -> str:
+        message = params.get("message", [""])[0]
+        state = params.get("state", [""])[0] or None
+        worker_type = params.get("type", [""])[0] or None
+        sort_key, order = sort_params(params)
+        refresh = refresh_seconds(params)
         message_html = f'<p>{html.escape(message)}</p>' if message else ""
         return f"""
 <h1>Tasks</h1>
 {message_html}
 {refresh_controls("/tasks", params)}
-<form method="get" action="/tasks" class="surface"><label>State</label><input name="state" value="{html.escape(state or "")}"><label>Worker Type</label><input name="type" value="{html.escape(worker_type or "")}"><button type="submit">Filter</button></form>
-<form method="post" action="/delete-tasks">
-{hidden_filters}
-<div class="actions"><button type="submit" class="danger">Delete Selected</button><span class="muted">Running tasks cannot be deleted from this view.</span></div>
-<table><thead><tr><th>Select</th><th>ID</th><th>State</th><th>Type</th><th>RC</th><th>Command</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-</form>
+<form method="get" action="/tasks" class="surface"><label>State</label><input name="state" value="{html.escape(state or "")}"><label>Worker Type</label><input name="type" value="{html.escape(worker_type or "")}"><input type="hidden" name="refresh" value="{html.escape(str(refresh))}"><input type="hidden" name="sort" value="{html.escape(sort_key)}"><input type="hidden" name="order" value="{html.escape(order)}"><button type="submit">Filter</button></form>
+<div id="task-list-data">
+{self.tasks_data_html(params)}
+</div>
 """
 
     def delete_tasks_page(self, params: dict[str, list[str]]) -> str:
@@ -677,13 +810,12 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         next_params = {
             key: values
             for key, values in params.items()
-            if key in {"state", "type", "refresh"}
+            if key in {"state", "type", "refresh", "sort", "order"}
         }
         next_params["message"] = [" ".join(parts)]
         return self.tasks_page(next_params)
 
-    def task_page(self, params: dict[str, list[str]]) -> str:
-        task_id = params.get("id", [""])[0]
+    def task_detail_html(self, task_id: str) -> str:
         task = db.get_task(task_id, queue_dir=self.queue_dir)
         if task is None:
             return "<h1>Task Not Found</h1>"
@@ -693,12 +825,22 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             for event in events
         )
         return f"""
-<h1>Task {html.escape(task_id)}</h1>
-{refresh_controls("/task", params)}
 <h2>Metadata</h2><pre>{html.escape(json.dumps(task, indent=2, sort_keys=True))}</pre>
 <h2>Events</h2><table><thead><tr><th>Time</th><th>From</th><th>To</th><th>Message</th></tr></thead><tbody>{event_rows}</tbody></table>
 <h2>stdout</h2><pre>{html.escape(tail_text(task.get("stdout_path")))}</pre>
 <h2>stderr</h2><pre>{html.escape(tail_text(task.get("stderr_path")))}</pre>
+"""
+
+    def task_page(self, params: dict[str, list[str]]) -> str:
+        task_id = params.get("id", [""])[0]
+        if db.get_task(task_id, queue_dir=self.queue_dir) is None:
+            return "<h1>Task Not Found</h1>"
+        return f"""
+<h1>Task {html.escape(task_id)}</h1>
+{refresh_controls("/task", params)}
+<div id="task-detail-data">
+{self.task_detail_html(task_id)}
+</div>
 """
 
 

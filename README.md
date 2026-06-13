@@ -93,7 +93,7 @@ Open:
 http://127.0.0.1:8765
 ```
 
-The web UI can generate arbitrary shell commands from templates, copy them, submit them directly to the SQLite queue, and view the task table and logs. Queue status pages refresh every 5 seconds by default, with an interval field that can be changed or set to 0 to disable refresh. The task table supports selecting and deleting multiple non-running tasks. Template selection opens a popup with hard-coded submit/worker examples first, then JSON templates from `queue/data/template/`.
+The web UI can generate arbitrary shell commands from templates, copy them, submit them directly to the SQLite queue, and view the task table and logs. Queue status views refresh only the task table or task log data every 5 seconds by default, with an interval field that can be changed or set to 0 to disable refresh. The task table supports select-all, selecting and deleting multiple non-running tasks, and clicking sortable headers for ID, state, type, return code, and command. Template selection opens a popup with hard-coded submit/worker examples first, then JSON templates from `queue/data/template/`.
 
 Template placeholders:
 

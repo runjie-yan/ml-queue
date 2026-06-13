@@ -216,9 +216,9 @@ Example:
 /usr/bin/python queue/submit.py --queue-dir {queue-dir:folder} --type {worker type:name} -- {command:name}
 ```
 
-The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. Long command templates can be scrolled horizontally, and pressing Tab inside the command template inserts a tab character. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status and task-detail pages refresh every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
+The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. Long command templates can be scrolled horizontally, and pressing Tab inside the command template inserts a tab character. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status views refresh only the task table or task-detail log data every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
 
-The task table supports selecting multiple tasks and deleting them from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action.
+The task table supports select-all, selecting multiple tasks, and deleting selected tasks from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action or selected by select-all. Clicking ID, state, type, return code, or command headers sorts the task table; clicking the active header again toggles ascending and descending order.
 
 If a file placeholder line is set to `config/experiment/`, submission generates one task per file under that folder.
 
