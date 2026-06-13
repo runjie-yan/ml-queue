@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -222,6 +223,65 @@ class QueueSmokeTest(unittest.TestCase):
         self.assertEqual(len(tasks), 24)
         self.assertEqual({task["state"] for task in tasks}, {"done"})
         self.assertEqual(len({task["id"] for task in tasks}), 24)
+
+    def test_worker_updates_heartbeat_for_running_task(self) -> None:
+        task_id = db.submit_task(
+            f"{sys.executable} -c 'import time; time.sleep(2)'",
+            queue_dir=self.queue_dir,
+            cwd=REPO_ROOT,
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(WORKER),
+                "--queue-dir",
+                str(self.queue_dir),
+                "--worker-id",
+                "heartbeat-worker",
+                "--heartbeat-sec",
+                "0.2",
+                "--once",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        heartbeat_at = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            task = db.get_task(task_id, queue_dir=self.queue_dir)
+            heartbeat_at = task["heartbeat_at"]
+            if heartbeat_at and task["state"] == "running":
+                break
+            time.sleep(0.1)
+
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, msg=stderr or stdout)
+        self.assertIsNotNone(heartbeat_at)
+        self.assertEqual(db.get_task(task_id, queue_dir=self.queue_dir)["state"], "done")
+
+    def test_resubmit_stale_cli_creates_new_pending_copy_only_when_requested(self) -> None:
+        task_id = db.submit_task("echo stale", queue_dir=self.queue_dir, cwd=REPO_ROOT)
+        claimed = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type=db.DEFAULT_WORKER_TYPE,
+            worker_id="dead-worker",
+        )
+        self.assertEqual(claimed["id"], task_id)
+        self.assertEqual(db.resubmit_stale_tasks(queue_dir=self.queue_dir, stale_seconds=3600), [])
+
+        result = self.run_submit("--resubmit-stale", "--stale-sec", "0")
+        new_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+        self.assertEqual(len(new_ids), 1)
+        original = db.get_task(task_id, queue_dir=self.queue_dir)
+        new_task = db.get_task(new_ids[0], queue_dir=self.queue_dir)
+        self.assertEqual(original["state"], "running")
+        self.assertEqual(db.display_state(original, stale_seconds=0), "running(stale)")
+        self.assertEqual(new_task["state"], "pending")
+        self.assertEqual(new_task["command"], "echo stale")
+        self.assertIn(task_id, new_task["params_json"])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ DEFAULT_WORKER_TYPE = "BASE"
 TASK_STATES = {"pending", "running", "done", "failed", "canceled"}
 SQLITE_BUSY_TIMEOUT_MS = 30000
 LOCK_RETRY_SECONDS = 60.0
+DEFAULT_STALE_SECONDS = 3600
+_INITIALIZED_DB_PATHS: set[Path] = set()
 
 
 def default_queue_dir() -> Path:
@@ -26,6 +29,15 @@ def default_cwd() -> Path:
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def make_task_id() -> str:
@@ -79,8 +91,10 @@ def retry_locked(operation: Any, *, seconds: float = LOCK_RETRY_SECONDS) -> Any:
 
 
 def init_db(queue_dir: str | os.PathLike[str] | None = None) -> None:
+    root = resolve_queue_dir(queue_dir)
+
     def operation() -> None:
-        with connect(queue_dir) as conn:
+        with connect(root) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -100,10 +114,12 @@ def init_db(queue_dir: str | os.PathLike[str] | None = None) -> None:
                     return_code INTEGER,
                     stdout_path TEXT NOT NULL,
                     stderr_path TEXT NOT NULL,
+                    heartbeat_at TEXT,
                     error TEXT
                 )
                 """
             )
+            ensure_column(conn, "tasks", "heartbeat_at", "TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_tasks_state_type_created
@@ -132,11 +148,13 @@ def init_db(queue_dir: str | os.PathLike[str] | None = None) -> None:
             )
 
     retry_locked(operation)
+    _INITIALIZED_DB_PATHS.add(db_path(root))
 
 
 def init_db_if_missing(queue_dir: str | os.PathLike[str] | None = None) -> None:
     root = ensure_layout(queue_dir)
-    if not db_path(root).exists():
+    path = db_path(root)
+    if path not in _INITIALIZED_DB_PATHS:
         init_db(root)
 
 
@@ -160,10 +178,29 @@ def record_event(
     )
 
 
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if column not in {row["name"] for row in rows}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
+
+
+def is_task_stale(task: dict[str, Any], *, stale_seconds: int = DEFAULT_STALE_SECONDS) -> bool:
+    if task.get("state") != "running":
+        return False
+    heartbeat = parse_iso(str(task.get("heartbeat_at") or task.get("updated_at") or ""))
+    if heartbeat is None:
+        return True
+    return datetime.now().astimezone() - heartbeat > timedelta(seconds=stale_seconds)
+
+
+def display_state(task: dict[str, Any], *, stale_seconds: int = DEFAULT_STALE_SECONDS) -> str:
+    return "running(stale)" if is_task_stale(task, stale_seconds=stale_seconds) else str(task["state"])
 
 
 def submit_task(
@@ -322,11 +359,12 @@ def claim_next_task(
                 SET state = 'running',
                     worker_id = ?,
                     started_at = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    heartbeat_at = ?
                 WHERE id = ?
                   AND state = 'pending'
                 """,
-                (worker_id, timestamp, timestamp, task_id),
+                (worker_id, timestamp, timestamp, timestamp, task_id),
             )
             if cursor.rowcount != 1:
                 conn.rollback()
@@ -348,6 +386,38 @@ def claim_next_task(
             raise
         finally:
             conn.close()
+
+    return retry_locked(operation)
+
+
+def heartbeat_task(
+    task_id: str,
+    *,
+    queue_dir: str | os.PathLike[str] | None = None,
+    worker_id: str | None = None,
+) -> bool:
+    init_db_if_missing(queue_dir)
+
+    def operation() -> bool:
+        timestamp = now_iso()
+        params: list[Any] = [timestamp, timestamp, task_id]
+        worker_clause = ""
+        if worker_id is not None:
+            worker_clause = " AND worker_id = ?"
+            params.append(worker_id)
+        with connect(queue_dir) as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE tasks
+                SET heartbeat_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND state = 'running'
+                  {worker_clause}
+                """,
+                params,
+            )
+            return cursor.rowcount == 1
 
     return retry_locked(operation)
 
@@ -374,10 +444,11 @@ def finish_task(
                     updated_at = ?,
                     finished_at = ?,
                     return_code = ?,
-                    error = ?
+                    error = ?,
+                    heartbeat_at = ?
                 WHERE id = ?
                 """,
-                (state, timestamp, timestamp, return_code, error, task_id),
+                (state, timestamp, timestamp, return_code, error, timestamp, task_id),
             )
             record_event(
                 conn,
@@ -417,6 +488,56 @@ def cancel_task(task_id: str, *, queue_dir: str | os.PathLike[str] | None = None
             return cursor.rowcount == 1
 
     return retry_locked(operation)
+
+
+def stale_running_tasks(
+    *,
+    queue_dir: str | os.PathLike[str] | None = None,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+    worker_type: str | None = None,
+) -> list[dict[str, Any]]:
+    tasks = list_tasks(queue_dir=queue_dir, state="running", worker_type=worker_type)
+    return [task for task in tasks if is_task_stale(task, stale_seconds=stale_seconds)]
+
+
+def resubmit_stale_tasks(
+    *,
+    queue_dir: str | os.PathLike[str] | None = None,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+    worker_type: str | None = None,
+) -> list[str]:
+    original_tasks = stale_running_tasks(
+        queue_dir=queue_dir,
+        stale_seconds=stale_seconds,
+        worker_type=worker_type,
+    )
+    new_ids: list[str] = []
+    for task in original_tasks:
+        params = json.loads(str(task.get("params_json") or "{}"))
+        params["resubmitted_from"] = task["id"]
+        params["resubmitted_reason"] = f"stale_after_{stale_seconds}s"
+        new_id = submit_task(
+            str(task["command"]),
+            queue_dir=queue_dir,
+            worker_type=str(task["worker_type"]),
+            cwd=str(task["cwd"]),
+            split_id=task["split_id"],
+            split_count=task["split_count"],
+            params=params,
+        )
+        new_ids.append(new_id)
+        def operation(task_id: str = str(task["id"]), created_id: str = new_id) -> None:
+            with connect(queue_dir) as conn:
+                record_event(
+                    conn,
+                    task_id=task_id,
+                    from_state="running",
+                    to_state="running",
+                    message=f"stale task resubmitted as {created_id}",
+                )
+
+        retry_locked(operation)
+    return new_ids
 
 
 def delete_tasks(

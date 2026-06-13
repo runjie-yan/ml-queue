@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -338,6 +340,35 @@ class WebSubmissionTest(unittest.TestCase):
         self.assertIn('action="/delete-tasks"', body)
         self.assertIn("Command ^", body)
         self.assertLess(body.index("echo a"), body.index("echo b"))
+
+    def test_tasks_page_marks_stale_running_and_resubmits_by_button(self) -> None:
+        task_id = db.submit_task("echo stale-web", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))
+        claimed = db.claim_next_task(
+            queue_dir=self.queue_dir,
+            worker_type=db.DEFAULT_WORKER_TYPE,
+            worker_id="dead-worker",
+        )
+        self.assertEqual(claimed["id"], task_id)
+        old = (datetime.now().astimezone() - timedelta(seconds=10)).isoformat(timespec="microseconds")
+        with db.connect(self.queue_dir) as conn:
+            conn.execute(
+                "UPDATE tasks SET heartbeat_at = ?, updated_at = ? WHERE id = ?",
+                (old, old, task_id),
+            )
+        handler = web.build_handler(str(self.queue_dir), REPO_ROOT)
+        handler_instance = object.__new__(handler)
+
+        body = handler_instance.tasks_page({"stale_sec": ["1"], "refresh": ["0"]})
+        self.assertIn("running(stale)", body)
+        self.assertIn('action="/resubmit-stale"', body)
+        self.assertIn("Resubmit Stale Running", body)
+
+        submitted = handler_instance.resubmit_stale_page({"stale_sec": ["1"], "refresh": ["0"]})
+        tasks = db.list_tasks(queue_dir=self.queue_dir)
+        pending = [task for task in tasks if task["state"] == "pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["command"], "echo stale-web")
+        self.assertIn("Resubmitted 1 stale running task", submitted)
 
     def test_tasks_page_has_multi_select_delete_form(self) -> None:
         task_id = db.submit_task("echo delete-me", queue_dir=self.queue_dir, cwd=str(REPO_ROOT))

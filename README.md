@@ -160,6 +160,14 @@ Keep polling forever:
 python queue/worker.py --forever
 ```
 
+Workers update `heartbeat_at` while a command is running. A running task whose heartbeat is too old is shown as `running(stale)`, but it is not restarted automatically.
+
+Explicitly submit new pending copies of stale running tasks:
+
+```bash
+python queue/submit.py --resubmit-stale --stale-sec 3600
+```
+
 ### `db.py`
 
 Important internal helpers:
@@ -167,6 +175,9 @@ Important internal helpers:
 - `init_db(queue_dir=None)`: create the SQLite database and log directory.
 - `submit_task(command, ...)`: insert one pending task.
 - `claim_next_task(worker_type, worker_id, ...)`: atomically claim one pending task.
+- `heartbeat_task(task_id, ...)`: update the heartbeat for a running task.
+- `stale_running_tasks(stale_seconds, ...)`: list running tasks with old heartbeats.
+- `resubmit_stale_tasks(stale_seconds, ...)`: create new pending copies of stale running tasks.
 - `finish_task(task_id, state, return_code, ...)`: mark a running task as `done` or `failed`.
 - `cancel_task(task_id, ...)`: cancel a pending task.
 - `delete_tasks(task_ids, ...)`: remove selected non-running tasks and their events.

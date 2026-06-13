@@ -95,9 +95,10 @@ Worker behavior:
 
 1. Claim one pending task for the requested worker type.
 2. Commit the SQLite transaction.
-3. Run the shell command in the task working directory.
-4. Write stdout/stderr to `queue/data/log/`.
-5. Mark the task `done` or `failed`.
+3. Update `heartbeat_at` while the command is running.
+4. Run the shell command in the task working directory.
+5. Write stdout/stderr to `queue/data/log/`.
+6. Mark the task `done` or `failed`.
 
 Workers never hold a SQLite transaction while running a shell command.
 
@@ -123,6 +124,14 @@ pending -> canceled
 ```
 
 There is no automatic retry yet. Rerun failed work by submitting a new command.
+
+Running tasks are never automatically restarted. If a worker pod dies after claiming a task, the task remains `running` in the database. When its heartbeat is older than the stale threshold, the UI displays it as `running(stale)`. The user can then explicitly submit a new pending copy:
+
+```bash
+python queue/submit.py --resubmit-stale --stale-sec 3600
+```
+
+The original stale task remains `running` for audit/debugging; the resubmitted task records `resubmitted_from` in `params_json`.
 
 ## Database Tables
 
@@ -218,7 +227,7 @@ Example:
 
 The browser form shows the exact command lines immediately as the template or placeholder values change. The right panel can copy the commands or submit them directly to the SQLite queue. Long command templates can be scrolled horizontally, and pressing Tab inside the command template inserts a tab character. Template selection and saving use popup dialogs; save-name validation stays inside the save dialog. Queue status views refresh only the task table or task-detail log data every 5 seconds by default; set the refresh interval to 0 to disable auto refresh.
 
-The task table supports select-all, selecting multiple tasks, and deleting selected tasks from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action or selected by select-all. Clicking ID, state, type, return code, or command headers sorts the task table; clicking the active header again toggles ascending and descending order.
+The task table supports select-all, selecting multiple tasks, and deleting selected tasks from the queue. Running tasks are disabled in the delete form so an active worker is not interrupted by a UI delete action or selected by select-all. Stale running tasks can be resubmitted with the explicit web button. Clicking ID, state, type, return code, or command headers sorts the task table; clicking the active header again toggles ascending and descending order.
 
 If a file placeholder line is set to `config/experiment/`, submission generates one task per file under that folder.
 
