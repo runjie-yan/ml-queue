@@ -288,6 +288,15 @@ def refresh_controls(path: str, params: dict[str, list[str]]) -> str:
 """
 
 
+def stale_seconds(params: dict[str, list[str]]) -> int:
+    raw = params.get("stale_sec", [str(db.DEFAULT_STALE_SECONDS)])[0]
+    try:
+        value = int(raw)
+    except ValueError:
+        return db.DEFAULT_STALE_SECONDS
+    return max(1, value)
+
+
 def first_param(params: dict[str, list[str]], key: str, default: str = "") -> str:
     values = params.get(key)
     return values[0] if values else default
@@ -308,7 +317,7 @@ def sort_tasks(tasks: list[dict[str, Any]], *, sort_key: str, order: str) -> lis
         if sort_key == "type":
             return str(task["worker_type"])
         if sort_key == "state":
-            return str(task["state"])
+            return str(task.get("display_state", task["state"]))
         if sort_key == "rc":
             return (task["return_code"] is None, task["return_code"] if task["return_code"] is not None else 0)
         return str(task[sort_key])
@@ -319,7 +328,7 @@ def sort_tasks(tasks: list[dict[str, Any]], *, sort_key: str, order: str) -> lis
 def task_sort_link(params: dict[str, list[str]], *, key: str, label: str, current_key: str, current_order: str) -> str:
     next_order = "desc" if key == current_key and current_order == "asc" else "asc"
     query: dict[str, str] = {}
-    for name in ("state", "type", "refresh"):
+    for name in ("state", "type", "refresh", "stale_sec"):
         value = first_param(params, name)
         if value:
             query[name] = value
@@ -597,6 +606,8 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             self.write_html("Submitted Commands", self.submit_page(self.read_post()))
         elif parsed.path == "/delete-tasks":
             self.write_html("Queue Tasks", self.delete_tasks_page(self.read_post()))
+        elif parsed.path == "/resubmit-stale":
+            self.write_html("Queue Tasks", self.resubmit_stale_page(self.read_post()))
         elif parsed.path == "/api/preview":
             self.api_preview()
         elif parsed.path == "/api/save-template":
@@ -753,13 +764,16 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         state = params.get("state", [""])[0] or None
         worker_type = params.get("type", [""])[0] or None
         sort_key, order = sort_params(params)
+        stale_sec = stale_seconds(params)
         rows = []
         tasks = db.list_tasks(queue_dir=self.queue_dir, state=state, worker_type=worker_type)
+        for task in tasks:
+            task["display_state"] = db.display_state(task, stale_seconds=stale_sec)
         for task in sort_tasks(tasks, sort_key=sort_key, order=order):
             command = shorten(str(task["command"]), 120)
             disabled = " disabled" if task["state"] == "running" else ""
             rows.append(
-                f'<tr><td><input type="checkbox" name="task_id" value="{html.escape(task["id"])}"{disabled}></td><td><a href="/task?{urlencode({"id": task["id"]})}">{html.escape(task["id"])}</a></td><td>{html.escape(task["state"])}</td><td>{html.escape(task["worker_type"])}</td><td>{html.escape(str(task["return_code"])) if task["return_code"] is not None else ""}</td><td>{html.escape(command)}</td></tr>'
+                f'<tr><td><input type="checkbox" name="task_id" value="{html.escape(task["id"])}"{disabled}></td><td><a href="/task?{urlencode({"id": task["id"]})}">{html.escape(task["id"])}</a></td><td>{html.escape(task["display_state"])}</td><td>{html.escape(task["worker_type"])}</td><td>{html.escape(str(task["return_code"])) if task["return_code"] is not None else ""}</td><td>{html.escape(command)}</td></tr>'
             )
         headers = [
             '<th><input id="select-all-tasks" type="checkbox" title="Select all visible tasks"></th>',
@@ -771,7 +785,7 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         ]
         hidden_filters = "".join(
             f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
-            for key in ("state", "type", "refresh", "sort", "order")
+            for key in ("state", "type", "refresh", "sort", "order", "stale_sec")
             for value in params.get(key, [])
             if value
         )
@@ -789,12 +803,14 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         worker_type = params.get("type", [""])[0] or None
         sort_key, order = sort_params(params)
         refresh = refresh_seconds(params)
+        stale_sec = stale_seconds(params)
         message_html = f'<p>{html.escape(message)}</p>' if message else ""
         return f"""
 <h1>Tasks</h1>
 {message_html}
 {refresh_controls("/tasks", params)}
-<form method="get" action="/tasks" class="surface"><label>State</label><input name="state" value="{html.escape(state or "")}"><label>Worker Type</label><input name="type" value="{html.escape(worker_type or "")}"><input type="hidden" name="refresh" value="{html.escape(str(refresh))}"><input type="hidden" name="sort" value="{html.escape(sort_key)}"><input type="hidden" name="order" value="{html.escape(order)}"><button type="submit">Filter</button></form>
+<form method="get" action="/tasks" class="surface"><label>State</label><input name="state" value="{html.escape(state or "")}"><label>Worker Type</label><input name="type" value="{html.escape(worker_type or "")}"><label>Stale After Seconds</label><input name="stale_sec" type="number" min="1" value="{html.escape(str(stale_sec))}"><input type="hidden" name="refresh" value="{html.escape(str(refresh))}"><input type="hidden" name="sort" value="{html.escape(sort_key)}"><input type="hidden" name="order" value="{html.escape(order)}"><button type="submit">Filter</button></form>
+<form method="post" action="/resubmit-stale" class="surface"><input type="hidden" name="state" value="{html.escape(state or "")}"><input type="hidden" name="type" value="{html.escape(worker_type or "")}"><input type="hidden" name="refresh" value="{html.escape(str(refresh))}"><input type="hidden" name="sort" value="{html.escape(sort_key)}"><input type="hidden" name="order" value="{html.escape(order)}"><input type="hidden" name="stale_sec" value="{html.escape(str(stale_sec))}"><button type="submit">Resubmit Stale Running</button><span class="muted">Creates new pending copies only when clicked.</span></form>
 <div id="task-list-data">
 {self.tasks_data_html(params)}
 </div>
@@ -810,15 +826,31 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         next_params = {
             key: values
             for key, values in params.items()
-            if key in {"state", "type", "refresh", "sort", "order"}
+            if key in {"state", "type", "refresh", "sort", "order", "stale_sec"}
         }
         next_params["message"] = [" ".join(parts)]
+        return self.tasks_page(next_params)
+
+    def resubmit_stale_page(self, params: dict[str, list[str]]) -> str:
+        worker_type = params.get("type", [""])[0] or None
+        task_ids = db.resubmit_stale_tasks(
+            queue_dir=self.queue_dir,
+            stale_seconds=stale_seconds(params),
+            worker_type=worker_type,
+        )
+        next_params = {
+            key: values
+            for key, values in params.items()
+            if key in {"state", "type", "refresh", "sort", "order", "stale_sec"}
+        }
+        next_params["message"] = [f"Resubmitted {len(task_ids)} stale running task(s)."]
         return self.tasks_page(next_params)
 
     def task_detail_html(self, task_id: str) -> str:
         task = db.get_task(task_id, queue_dir=self.queue_dir)
         if task is None:
             return "<h1>Task Not Found</h1>"
+        task["display_state"] = db.display_state(task)
         events = db.list_events(task_id, queue_dir=self.queue_dir)
         event_rows = "".join(
             f"<tr><td>{html.escape(str(event['ts']))}</td><td>{html.escape(str(event['from_state']))}</td><td>{html.escape(str(event['to_state']))}</td><td>{html.escape(str(event['message']))}</td></tr>"

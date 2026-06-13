@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type", dest="worker_type", default=db.DEFAULT_WORKER_TYPE)
     parser.add_argument("--cwd", default=str(db.default_cwd()))
     parser.add_argument("--splits", type=int, default=None, help="Create N split tasks.")
+    parser.add_argument("--resubmit-stale", action="store_true", help="Submit new pending copies of stale running tasks.")
+    parser.add_argument("--stale-sec", type=int, default=db.DEFAULT_STALE_SECONDS, help="Heartbeat age threshold for stale running tasks.")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
 
@@ -89,7 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     db.init_db(args.queue_dir)
-    task_ids = submit_splits(args) if args.splits is not None else submit_single(args)
+    if args.resubmit_stale:
+        task_ids = db.resubmit_stale_tasks(
+            queue_dir=args.queue_dir,
+            stale_seconds=args.stale_sec,
+            worker_type=args.worker_type,
+        )
+    else:
+        task_ids = submit_splits(args) if args.splits is not None else submit_single(args)
     for task_id in task_ids:
         print(task_id)
     return 0
